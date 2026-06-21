@@ -5,6 +5,11 @@
 [![License](https://img.shields.io/badge/license-Apache2.0-yellow.svg)](https://opensource.org/license/apache-2-0)
 [![Discord](https://img.shields.io/badge/-Discord-5865F2?style=flat&logo=Discord&logoColor=white)](https://discord.gg/ZwcVwxv5rq)
 
+## Fork说明
+- 自己琢磨的零碎代码，正在努力学习RL Humanoid Locomotion中
+- 重点适配了g1模型，同时对一些因为版本不匹配导致的问题进行了迁移和修复。
+- 把用到的unitree_mujoco和unitree_sdk2作为子仓库，方便管理
+
 
 ## Overview
 
