@@ -49,6 +49,7 @@ import gymnasium as gym
 import os
 import time
 import torch
+from importlib.metadata import version
 
 from rsl_rl.runners import OnPolicyRunner
 
@@ -56,8 +57,11 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
+try:
+    from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+except ModuleNotFoundError:
+    get_published_pretrained_checkpoint = None
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx, handle_deprecated_rsl_rl_cfg
 from isaaclab_tasks.utils import get_checkpoint_path
 
 import unitree_rl_lab.tasks  # noqa: F401
@@ -76,11 +80,18 @@ def main():
     )
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
 
+    # handle deprecated configurations
+    installed_version = version("rsl-rl-lib")
+    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
+
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
     if args_cli.use_pretrained_checkpoint:
+        if get_published_pretrained_checkpoint is None:
+            print("[INFO] The '--use_pretrained_checkpoint' feature is not available in this version of Isaac Lab.")
+            return
         resume_path = get_published_pretrained_checkpoint("rsl_rl", args_cli.task)
         if not resume_path:
             print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
@@ -132,14 +143,20 @@ def main():
     # extract the neural network module
     # we do this in a try-except to maintain backwards compatibility.
     try:
-        # version 2.3 onwards
-        policy_nn = runner.alg.policy
+        # version 5.0.0 onwards
+        policy_nn = runner.alg.get_policy()
     except AttributeError:
-        # version 2.2 and below
-        policy_nn = runner.alg.actor_critic
+        try:
+            # version 2.3 onwards
+            policy_nn = runner.alg.policy
+        except AttributeError:
+            # version 2.2 and below
+            policy_nn = runner.alg.actor_critic
 
     # extract the normalizer
-    if hasattr(policy_nn, "actor_obs_normalizer"):
+    if hasattr(policy_nn, "obs_normalizer") and not isinstance(policy_nn.obs_normalizer, torch.nn.Identity):
+        normalizer = policy_nn.obs_normalizer
+    elif hasattr(policy_nn, "actor_obs_normalizer"):
         normalizer = policy_nn.actor_obs_normalizer
     elif hasattr(policy_nn, "student_obs_normalizer"):
         normalizer = policy_nn.student_obs_normalizer
@@ -148,8 +165,30 @@ def main():
 
     # export policy to onnx/jit
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    if version("rsl-rl-lib").startswith("5."):
+        # RSL-RL 5.x: model has built-in export methods with integrated normalizer
+        os.makedirs(export_model_dir, exist_ok=True)
+        # Export to TorchScript
+        import pathlib
+        jit_model = policy_nn.as_jit()
+        script = torch.jit.script(jit_model)
+        script.save(os.path.join(export_model_dir, "policy.pt"))
+        # Export to ONNX
+        onnx_model = policy_nn.as_onnx(verbose=False)
+        onnx_model.to("cpu")
+        onnx_model.eval()
+        torch.onnx.export(
+            onnx_model,
+            onnx_model.get_dummy_inputs(),
+            os.path.join(export_model_dir, "policy.onnx"),
+            export_params=True,
+            opset_version=18,
+            input_names=onnx_model.input_names,
+            output_names=onnx_model.output_names,
+        )
+    else:
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
     dt = env.unwrapped.step_dt
 
@@ -157,6 +196,7 @@ def main():
     obs = env.get_observations()
     if version("rsl-rl-lib").startswith("2.3."):
         obs, _ = env.get_observations()
+    # RSL-RL 5.x uses TensorDict observations, handled automatically by the wrapper
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
